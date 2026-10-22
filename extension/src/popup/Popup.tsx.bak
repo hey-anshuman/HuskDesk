@@ -1,0 +1,244 @@
+﻿import { useEffect, useRef, useState } from 'react';
+import { captureCurrentWindow, isEligibleUrl } from '../storage/capture';
+import { getWorkspaces, type Workspace } from '../storage/workspaces';
+
+function getInitialTheme(): 'light' | 'dark' {
+  try {
+    const saved = localStorage.getItem('huskdesk-theme');
+    if (saved === 'dark' || saved === 'light') return saved;
+  } catch {
+    // Storage unavailable â€” proceed with system preference.
+  }
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function applyTheme(theme: 'light' | 'dark') {
+  document.documentElement.dataset.theme = theme;
+}
+
+export default function Popup() {
+  const [theme, setTheme] = useState<'light' | 'dark'>(getInitialTheme);
+  const [notice, setNotice] = useState('');
+  const [noticeType, setNoticeType] = useState<'info' | 'error' | 'success'>('info');
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [capturing, setCapturing] = useState(false);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Apply theme on mount using initial value, runs once.
+  useEffect(() => {
+    applyTheme(getInitialTheme());
+  }, []);
+
+  // Load recent workspaces on mount
+  useEffect(() => {
+    let active = true;
+    getWorkspaces()
+      .then((ws) => {
+        if (active) setWorkspaces(ws);
+      })
+      .catch(() => {
+        if (active) { setNotice('Could not load saved workspaces.'); setNoticeType('error'); }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  function showNotice(message: string, type: 'info' | 'error' | 'success' = 'info') {
+    setNotice(message);
+    setNoticeType(type);
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = setTimeout(() => setNotice(''), 5000);
+  }
+
+  function toggleTheme() {
+    const next = theme === 'light' ? 'dark' : 'light';
+    setTheme(next);
+    applyTheme(next);
+    try {
+      localStorage.setItem('huskdesk-theme', next);
+    } catch {
+      // Theme still updates for this session.
+    }
+  }
+
+  function openDashboard() {
+    chrome.runtime.openOptionsPage();
+  }
+
+  async function handleCapture() {
+    const name = window.prompt('Name this workspace:', 'My workspace');
+    if (name === null) return; // User cancelled
+
+    const trimmed = name.trim();
+    if (!trimmed) {
+      showNotice('Please enter a workspace name.', 'error');
+      return;
+    }
+
+    setCapturing(true);
+    setNotice('');
+
+    try {
+      const workspace = await captureCurrentWindow(trimmed);
+      setWorkspaces((prev) => [workspace, ...prev]);
+      showNotice(`Saved "${workspace.name}" with ${workspace.tabs.length} tab${workspace.tabs.length === 1 ? '' : 's'}.`, 'success');
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : 'Workspace capture failed.', 'error');
+    } finally {
+      setCapturing(false);
+    }
+  }
+
+  async function openWorkspace(workspace: Workspace) {
+    const validTabs = workspace.tabs.filter((t) => isEligibleUrl(t.url));
+    if (validTabs.length === 0) {
+      showNotice('No valid URLs to open.', 'error');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Open "${workspace.name}"?\nThis will open ${validTabs.length} tab${validTabs.length === 1 ? '' : 's'} in a new window. Your existing tabs will not be closed.`,
+    );
+    if (!confirmed) return;
+
+    let openedTabs = 0;
+    try {
+      const newWindow = await chrome.windows.create({
+        url: validTabs[0].url,
+        focused: true,
+      });
+
+      if (!newWindow || newWindow.id === undefined) {
+        throw new Error('Chrome did not return the new window ID.');
+      }
+      openedTabs = 1;
+
+      let firstTab: chrome.tabs.Tab | undefined;
+      if (!firstTab) {
+        const createdTabs = await chrome.tabs.query({ windowId: newWindow.id });
+        firstTab = createdTabs.find(
+          (tab) => typeof tab.id === 'number' && tab.url === validTabs[0].url,
+        );
+      }
+
+      if (firstTab?.id === undefined) {
+        throw new Error('The first tab opened, but its state could not be verified.');
+      }
+
+      await chrome.tabs.update(firstTab.id, { pinned: validTabs[0].pinned });
+
+      for (const tab of validTabs.slice(1)) {
+        await chrome.tabs.create({
+          windowId: newWindow.id,
+          url: tab.url,
+          pinned: tab.pinned,
+        });
+        openedTabs += 1;
+      }
+
+      showNotice(
+        `Opened ${openedTabs} tab${openedTabs === 1 ? '' : 's'} in a new window.`,
+        'success',
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Could not open workspace tabs.';
+      if (openedTabs > 0) {
+        showNotice(
+          `Opened ${openedTabs} of ${validTabs.length} tabs. ${detail} Check the new window before retrying.`,
+          'error',
+        );
+      } else {
+        showNotice(detail, 'error');
+      }
+    }
+  }
+
+  return (
+    <main className="popup-shell grid-bg">
+      <header className="popup-header">
+        <div className="brand-lockup">
+          <div className="brand-mark" aria-hidden="true">h.</div>
+          <div>
+            <div className="brand-name">huskdesk</div>
+            <div className="brand-tagline">Close the tabs. Keep the context.</div>
+          </div>
+        </div>
+        <button
+          className="icon-btn"
+          onClick={toggleTheme}
+          aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`}
+          title="Toggle theme"
+        >
+          {theme === 'light' ? 'â˜¾' : 'â˜€'}
+        </button>
+      </header>
+
+      <section className="popup-hero feature-card">
+        <span className="accent-label accent-pink">YOUR WORKSPACE, PRESERVED</span>
+        <h1>Pick up where <span className="accent-word">you left off.</span></h1>
+        <p>Capture tabs from this window and restore them later â€” nothing leaves your device.</p>
+        <button
+          className="btn btn-primary popup-primary"
+          onClick={handleCapture}
+          disabled={capturing}
+          aria-busy={capturing}
+        >
+          <span aria-hidden="true">{capturing ? 'â€¦' : 'ï¼‹'}</span>
+          {capturing ? 'Saving workspaceâ€¦' : 'Save current workspace'}
+        </button>
+      </section>
+
+      {notice && (
+        <p
+          role="status"
+          className={`popup-notice popup-notice--${noticeType}`}
+          aria-live="polite"
+        >
+          {notice}
+        </p>
+      )}
+
+      <section className="popup-section surface-card">
+        <div className="popup-section-title">
+          <span>Recent workspaces</span>
+          <span className="accent-label accent-lavender">LIBRARY</span>
+        </div>
+        {workspaces.length === 0 ? (
+          <div className="popup-empty">
+            <div style={{ fontSize: 22, marginBottom: 5 }} aria-hidden="true">â–¤</div>
+            <strong style={{ display: 'block', color: 'var(--text)', marginBottom: 4 }}>Your library starts here</strong>
+            Capture a workspace above to get started.
+          </div>
+        ) : (
+          <ul className="popup-workspace-list" role="list">
+            {workspaces.slice(0, 4).map((ws) => (
+              <li key={ws.id} className="popup-workspace-item">
+                <div className="popup-workspace-icon" aria-hidden="true">â–¤</div>
+                <div className="popup-workspace-info">
+                  <strong title={ws.name}>{ws.name}</strong>
+                  <span>{ws.tabs.length} tab{ws.tabs.length === 1 ? '' : 's'} Â· {new Date(ws.createdAt).toLocaleDateString()}</span>
+                </div>
+                <button
+                  className="btn btn-quiet popup-open-btn"
+                  onClick={() => openWorkspace(ws)}
+                  title={`Open "${ws.name}"`}
+                  aria-label={`Open workspace ${ws.name}`}
+                >
+                  â†—
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <footer className="popup-footer">
+        <span>LOCAL-FIRST BY DESIGN</span>
+        <button className="btn btn-secondary" onClick={openDashboard}>Open dashboard â†—</button>
+      </footer>
+    </main>
+  );
+}
+
+
